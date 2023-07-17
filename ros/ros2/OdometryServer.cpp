@@ -44,6 +44,54 @@
 #include "tf2_ros/static_transform_broadcaster.h"
 #include "tf2_ros/transform_broadcaster.h"
 
+class _DynamicListenerQoS : public rclcpp::QoS
+{
+public:
+  explicit _DynamicListenerQoS(size_t depth = 100)
+  : rclcpp::QoS(depth) {}
+};
+
+class _StaticListenerQoS : public rclcpp::QoS
+{
+public:
+  explicit _StaticListenerQoS(size_t depth = 100)
+  : rclcpp::QoS(depth)
+  {
+    transient_local();
+  }
+};
+
+
+namespace detail
+{
+template<class AllocatorT = std::allocator<void>>
+rclcpp::SubscriptionOptionsWithAllocator<AllocatorT>
+get_default_transform_listener_sub_options()
+{
+  rclcpp::SubscriptionOptionsWithAllocator<AllocatorT> options;
+  options.qos_overriding_options = rclcpp::QosOverridingOptions{
+    rclcpp::QosPolicyKind::Depth,
+    rclcpp::QosPolicyKind::Durability,
+    rclcpp::QosPolicyKind::History,
+    rclcpp::QosPolicyKind::Reliability};
+  options.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+  return options;
+}
+
+template<class AllocatorT = std::allocator<void>>
+rclcpp::SubscriptionOptionsWithAllocator<AllocatorT>
+get_default_transform_listener_static_sub_options()
+{
+  rclcpp::SubscriptionOptionsWithAllocator<AllocatorT> options;
+  options.qos_overriding_options = rclcpp::QosOverridingOptions{
+    rclcpp::QosPolicyKind::Depth,
+    rclcpp::QosPolicyKind::History,
+    rclcpp::QosPolicyKind::Reliability};
+  options.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+  return options;
+}
+}  // namespace detail
+
 namespace kiss_icp_ros {
 
 using utils::EigenToPointCloud2;
@@ -73,11 +121,6 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     // Construct the main KISS-ICP odometry node
     odometry_ = kiss_icp::pipeline::KissICP(config_);
 
-    // Intialize subscribers
-    pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        "pointcloud_topic", rclcpp::SensorDataQoS(),
-        std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
-
     // Intialize publishers
     rclcpp::QoS qos(rclcpp::KeepLast{queue_size_});
     odom_publisher_ = create_publisher<nav_msgs::msg::Odometry>("odometry", qos);
@@ -87,6 +130,17 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
 
     // Initialize the transform broadcaster
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+    // Initialize the transform listener
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(
+        *tf_buffer_, 
+        this,
+        true,
+        _DynamicListenerQoS(),
+        _StaticListenerQoS(),
+        detail::get_default_transform_listener_sub_options(),
+        detail::get_default_transform_listener_static_sub_options());
 
     // Intialize trajectory publisher
     path_msg_.header.frame_id = odom_frame_;
@@ -118,7 +172,43 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
         br->sendTransform(alias_transform_msg);
     }
 
-    RCLCPP_INFO(this->get_logger(), "KISS-ICP ROS 2 odometry node initialized");
+    // Intialize subscribers
+    pointcloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        "pointcloud_topic", rclcpp::SensorDataQoS(),
+        std::bind(&OdometryServer::RegisterFrame, this, std::placeholders::_1));
+
+    RCLCPP_INFO(this->get_logger(), "KISS-ICP ROS2 odometry node initialized");
+}
+
+bool OdometryServer::WaitTransform(
+    const std::string & base_frame, const std::string & fixed_frame, const rclcpp::Time & time_a,
+    const rclcpp::Time & time_b, geometry_msgs::msg::TransformStamped & out) {
+    while (true) {
+        try {
+            out = tf_buffer_->lookupTransform(base_frame, time_a, base_frame, time_b, fixed_frame);
+            return true;
+        } catch (tf2::TransformException & ex) {
+            if (ex.what()[35] == 'a') {
+                // "Lookup would require extrapolation at time..." (only one value in buffer)
+                // Wait a bit more for at least a second TF (we may fall through in the next loops)...
+                std::this_thread::yield();
+            } else if (ex.what()[44] == 'f') {
+                // "Lookup would require extrapolation into the future..."
+                // Wait a bit more...
+                std::this_thread::yield();
+            } else if (ex.what()[44] == 'p') {
+                // "Lookup would require extrapolation into the past..."
+                // No hope to receive older data, return without waiting
+                RCLCPP_INFO(get_logger(), "%s", ex.what());
+                return false;
+            } else {
+                // Unknown error message, might need to add if-else branches to account for it
+                RCLCPP_INFO(get_logger(), "%s", ex.what());
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::nanoseconds(200));
+    }
+    return true;
 }
 
 void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg) {
@@ -128,8 +218,28 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
         return GetTimestamps(msg);
     }();
 
+    static rclcpp::Time prev_time =rclcpp::Time(0);
+    rclcpp::Time cur_time = msg->header.stamp;
+
+    geometry_msgs::msg::TransformStamped guess_tf;
+    bool ok = WaitTransform("base_link", "odom", prev_time, cur_time, guess_tf);
+    prev_time = cur_time;
+
+    Eigen::Vector3d pos {
+        guess_tf.transform.translation.x, 
+        guess_tf.transform.translation.y, 
+        guess_tf.transform.translation.z};
+
+    Eigen::Quaterniond quat(
+        guess_tf.transform.rotation.w, 
+        guess_tf.transform.rotation.x, 
+        guess_tf.transform.rotation.y, 
+        guess_tf.transform.rotation.z);
+
+    Sophus::SE3d guess(quat, pos);
+
     // Register frame, main entry point to KISS-ICP pipeline
-    const auto &[frame, keypoints] = odometry_.RegisterFrame(points, timestamps);
+    const auto &[frame, keypoints] = odometry_.RegisterFrame(points, timestamps, guess);
 
     // PublishPose
     const auto pose = odometry_.poses().back();

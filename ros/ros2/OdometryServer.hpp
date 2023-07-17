@@ -31,6 +31,8 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "tf2_ros/transform_broadcaster.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_ros/buffer.h"
 
 namespace kiss_icp_ros {
 
@@ -43,6 +45,9 @@ public:
 private:
     /// Register new frame
     void RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
+    bool WaitTransform(
+        const std::string & base_frame, const std::string & fixed_frame, const rclcpp::Time & time_a,
+        const rclcpp::Time & time_b, geometry_msgs::msg::TransformStamped & out);
 
 private:
     /// Ros node stuff
@@ -52,6 +57,10 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     bool publish_odom_tf_;
     bool publish_alias_tf_;
+
+    /// Tools for listening TFs.
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     /// Data subscribers.
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_sub_;
