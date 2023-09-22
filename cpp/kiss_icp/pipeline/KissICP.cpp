@@ -39,7 +39,7 @@ KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vec
     const auto prediction = GetPredictionModel();
     const auto last_pose = !poses_.empty() ? poses_.back() : Sophus::SE3d();
     const auto initial_guess = last_pose * prediction;
-    return RegisterFrame(frame, timestamps, initial_guess);                                                
+    return RegisterFrame(frame, timestamps, initial_guess);
 }
 
 KissICP::Vector3dVectorTuple KissICP::RegisterFrame(const std::vector<Eigen::Vector3d> &frame,

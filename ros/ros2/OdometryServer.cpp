@@ -105,6 +105,7 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     odom_frame_ = declare_parameter<std::string>("odom_frame", odom_frame_);
     publish_alias_tf_ = declare_parameter<bool>("publish_alias_tf", publish_alias_tf_);
     publish_odom_tf_ = declare_parameter<bool>("publish_odom_tf", publish_alias_tf_);
+    guess_enable = declare_parameter<bool>("guess_enable", false);
     config_.max_range = declare_parameter<double>("max_range", config_.max_range);
     config_.min_range = declare_parameter<double>("min_range", config_.min_range);
     config_.deskew = declare_parameter<bool>("deskew", config_.deskew);
@@ -134,7 +135,7 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
     // Initialize the transform listener
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(
-        *tf_buffer_, 
+        *tf_buffer_,
         this,
         true,
         _DynamicListenerQoS(),
@@ -144,7 +145,11 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
 
     // Intialize trajectory publisher
     path_msg_.header.frame_id = odom_frame_;
+    guess_msg_.header.frame_id = odom_frame_;
+    phantom_msg_.header.frame_id = odom_frame_;
     traj_publisher_ = create_publisher<nav_msgs::msg::Path>("trajectory", qos);
+    guess_publisher_ = create_publisher<nav_msgs::msg::Path>("guess", qos);
+    phantom_publisher_ = create_publisher<nav_msgs::msg::Path>("phantom", qos);
 
     // Broadcast a static transformation that links with identity the specified base link to the
     // pointcloud_frame, basically to always be able to visualize the frame in rviz
@@ -181,11 +186,11 @@ OdometryServer::OdometryServer(const rclcpp::NodeOptions &options)
 }
 
 bool OdometryServer::WaitTransform(
-    const std::string & base_frame, const std::string & fixed_frame, const rclcpp::Time & time_a,
-    const rclcpp::Time & time_b, geometry_msgs::msg::TransformStamped & out) {
+    const std::string & base_frame, const std::string & target_frame,
+    const rclcpp::Time & time, geometry_msgs::msg::TransformStamped & out) {
     while (true) {
         try {
-            out = tf_buffer_->lookupTransform(base_frame, time_a, base_frame, time_b, fixed_frame);
+            out = tf_buffer_->lookupTransform(base_frame, target_frame, time);
             return true;
         } catch (tf2::TransformException & ex) {
             if (ex.what()[35] == 'a') {
@@ -218,28 +223,49 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
         return GetTimestamps(msg);
     }();
 
-    static rclcpp::Time prev_time =rclcpp::Time(0);
-    rclcpp::Time cur_time = msg->header.stamp;
+    Sophus::SE3d guess{};
+    Sophus::SE3d s_c{};
 
-    geometry_msgs::msg::TransformStamped guess_tf;
-    bool ok = WaitTransform("base_link", "odom", prev_time, cur_time, guess_tf);
-    prev_time = cur_time;
+    if (guess_enable) {
+        geometry_msgs::msg::TransformStamped cur_tf;
+        WaitTransform("odom", "base_link", msg->header.stamp, cur_tf);
 
-    Eigen::Vector3d pos {
-        guess_tf.transform.translation.x, 
-        guess_tf.transform.translation.y, 
-        guess_tf.transform.translation.z};
+        Eigen::Vector3d pos_c {
+            cur_tf.transform.translation.x,
+            cur_tf.transform.translation.y,
+            cur_tf.transform.translation.z};
 
-    Eigen::Quaterniond quat(
-        guess_tf.transform.rotation.w, 
-        guess_tf.transform.rotation.x, 
-        guess_tf.transform.rotation.y, 
-        guess_tf.transform.rotation.z);
+        Eigen::Quaterniond quat_c(
+            cur_tf.transform.rotation.w,
+            cur_tf.transform.rotation.x,
+            cur_tf.transform.rotation.y,
+            cur_tf.transform.rotation.z);
 
-    Sophus::SE3d guess(quat, pos);
+        s_c = Sophus::SE3d(quat_c, pos_c);
+
+        geometry_msgs::msg::PoseStamped phantom_msg;
+        phantom_msg.pose.orientation.x = s_c.unit_quaternion().x();
+        phantom_msg.pose.orientation.y = s_c.unit_quaternion().y();
+        phantom_msg.pose.orientation.z = s_c.unit_quaternion().z();
+        phantom_msg.pose.orientation.w = s_c.unit_quaternion().w();
+        phantom_msg.pose.position.x = s_c.translation().x();
+        phantom_msg.pose.position.y = s_c.translation().y();
+        phantom_msg.pose.position.z = s_c.translation().z();
+        phantom_msg.header.stamp = msg->header.stamp;
+        phantom_msg.header.frame_id = odom_frame_;
+
+        phantom_msg_.poses.push_back(phantom_msg);
+
+        guesses_.push_back(s_c);
+        const size_t N = guesses_.size();
+        if (N >= 2) {
+            guess = guesses_[N-2].inverse() * guesses_[N-1];
+        }
+    }
+    phantom_publisher_->publish(phantom_msg_);
 
     // Register frame, main entry point to KISS-ICP pipeline
-    const auto &[frame, keypoints] = odometry_.RegisterFrame(points, timestamps, guess);
+    const auto &[frame, keypoints] = odometry_.RegisterFrame(points, timestamps, s_c);
 
     // PublishPose
     const auto pose = odometry_.poses().back();
@@ -295,5 +321,6 @@ void OdometryServer::RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSha
     auto local_map_header = msg->header;
     local_map_header.frame_id = odom_frame_;
     map_publisher_->publish(std::move(EigenToPointCloud2(odometry_.LocalMap(), local_map_header)));
+    RCLCPP_WARN(get_logger(), "\tRegistered frame");
 }
 }  // namespace kiss_icp_ros

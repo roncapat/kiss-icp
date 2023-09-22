@@ -46,8 +46,8 @@ private:
     /// Register new frame
     void RegisterFrame(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &msg);
     bool WaitTransform(
-        const std::string & base_frame, const std::string & fixed_frame, const rclcpp::Time & time_a,
-        const rclcpp::Time & time_b, geometry_msgs::msg::TransformStamped & out);
+        const std::string & base_frame, const std::string & target_frame,
+        const rclcpp::Time & time, geometry_msgs::msg::TransformStamped & out);
 
 private:
     /// Ros node stuff
@@ -57,6 +57,8 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     bool publish_odom_tf_;
     bool publish_alias_tf_;
+    bool guess_enable;
+    std::vector<Sophus::SE3d> guesses_;
 
     /// Tools for listening TFs.
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -72,8 +74,8 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_publisher_;
 
     /// Path publisher
-    nav_msgs::msg::Path path_msg_;
-    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_publisher_;
+    nav_msgs::msg::Path path_msg_, guess_msg_, phantom_msg_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr traj_publisher_, guess_publisher_, phantom_publisher_;
 
     /// KISS-ICP
     kiss_icp::pipeline::KissICP odometry_;
